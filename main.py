@@ -67,18 +67,18 @@ DVSA_APPLICATION_URL = "https://driverpracticaltest.dvsa.gov.uk/application"
 DVSA_DELAY = 60
 MAX_ATTEMPTS = 4
 
-BLOCK_IMAGES = True
+BLOCK_IMAGES = False
 SOLVE_MANUALLY = False
 RUN_ON_VM = False
 
-DVSA_OPEN_TIME = dtime(6, 5)
-DVSA_CLOSE_TIME = dtime(23, 35)
+DVSA_OPEN_TIME = dtime(6, 0, 30)
+DVSA_CLOSE_TIME = dtime(21, 35)
 
 # Coordinates used for hardware click puzzle
 COORD_TOP_RIGHT = (820, 420)
 COORD_BOTTOM_LEFT = None  # e.g. (1020, 485) if desired
 
-HALIFAX_TEST = True
+ALTERNATIVE_TEST = None
 
 
 ###############################################################################
@@ -456,182 +456,286 @@ def run_initial_booking_flow(config_data):
       - Enter licence
       - Enter date and centre
       - Click through to test centre page
+      - Choose an available slot
+      - Click continue and confirm
     """
     logger.info("Starting Initial Booking Flow...")
     licence_num = config_data.get("licence", "")
 
-    if HALIFAX_TEST is True:
-        postcode = "Halifax"
+    # Use alternative test centre if defined; otherwise, default postcode.
+    if ALTERNATIVE_TEST is not None:
+        postcode = ALTERNATIVE_TEST[0]
     else:
         postcode = "NE21PL"
 
-    for attempt in range(MAX_ATTEMPTS):
+    attempt = 0
+    # Loop until we complete a booking attempt or hit MAX_ATTEMPTS.
+    while attempt < MAX_ATTEMPTS:
+        # Check if DVSA is open; if not, wait without counting as an attempt.
+        if not is_time_between(DVSA_OPEN_TIME, DVSA_CLOSE_TIME):
+            logger.info("Currently outside DVSA operational hours (%s - %s). Waiting...",
+                        DVSA_OPEN_TIME, DVSA_CLOSE_TIME)
+            random_sleep(10, 5)
+            continue
+
         logger.info("-" * 60)
         logger.info("Initial booking attempt %d / %d", attempt + 1, MAX_ATTEMPTS)
+        print("DVSA is open. Proceeding with booking flow.")
+        driver = None
 
-        if is_time_between(DVSA_OPEN_TIME, DVSA_CLOSE_TIME):
-            print("DVSA is open. Proceeding with booking flow.")
-            driver = None
-            try:
-                # Setup driver
-                print("Setting up driver...")
-                chrome_options = uc.ChromeOptions()
-                if BLOCK_IMAGES:
-                    print("Blocking images to speed up loading...")
-                    prefs = {"profile.managed_default_content_settings.images": 2}
-                    chrome_options.add_experimental_option("prefs", prefs)
-                else:
-                    print("Not blocking images. Loading everything...")
+        try:
+            # Setup driver
+            print("Setting up driver...")
+            chrome_options = uc.ChromeOptions()
+            if BLOCK_IMAGES:
+                print("Blocking images to speed up loading...")
+                prefs = {"profile.managed_default_content_settings.images": 2}
+                chrome_options.add_experimental_option("prefs", prefs)
+            else:
+                print("Not blocking images. Loading everything...")
 
-                if RUN_ON_VM:
-                    print("Running on VM. Adding VM-specific options...")
-                    chrome_options.add_argument("--disable-gpu")
-                    chrome_options.add_argument("window-size=1400,900")
-                    chrome_options.add_argument(
-                        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.131 Safari/537.36"
-                    )
-                else:
-                    print("Not running on VM. Using default options.")
-
-                if BUSTER_ENABLED:
-                    print("Adding Buster extension for captcha solving...")
-                    chrome_options.add_extension(BUSTER_PATH)
-                else:
-                    print("Not using Buster extension.")
-
-                print("Using Chrome binary:", chrome_options.binary_location)
-
-                driver = uc.Chrome(
-                    driver_executable_path=r"C:\chromedriver\chromedriver.exe",  # Adjust path as needed
-                    options=chrome_options,
-                    use_subprocess=True,
-                    patcher=False
+            if RUN_ON_VM:
+                print("Running on VM. Adding VM-specific options...")
+                chrome_options.add_argument("--disable-gpu")
+                chrome_options.add_argument("window-size=1400,900")
+                chrome_options.add_argument(
+                    "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.131 Safari/537.36"
                 )
+            else:
+                print("Not running on VM. Using default options.")
 
-                logger.info("Driver created for initial booking flow.")
-                driver.get(DVSA_APPLICATION_URL)
-                time.sleep(2)
+            if BUSTER_ENABLED:
+                print("Adding Buster extension for captcha solving...")
+                chrome_options.add_extension(BUSTER_PATH)
+            else:
+                print("Not using Buster extension.")
 
-                # Solve captcha/firewall
-                for _ in range(5):
-                    status = check_firewall_and_queue(driver)
-                    if status in ("queue", "firewall"):
-                        logger.info("Handling queue/firewall or recaptcha.")
-                        solved = solve_captcha(
-                            driver,
-                            skip=SOLVE_MANUALLY,
-                            coord_top_right=COORD_TOP_RIGHT,
-                            coord_bottom_left=COORD_BOTTOM_LEFT
-                        )
-                        if not solved:
-                            logger.warning("Captcha failed. Refreshing...")
-                            driver.refresh()
-                            time.sleep(3)
-                            continue
-                        else:
-                            break
-                    elif status in ("ok", "login_required"):
-                        break
-                    elif status == "error":
-                        logger.warning("Error page encountered. Refreshing.")
-                        time.sleep(3)
+            # Set the Chrome binary location (adjust if you use Chromium)
+            chrome_options.binary_location = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+            print("Using Chrome binary:", chrome_options.binary_location)
+
+            # Launch the driver using your local chromedriver and disable patching.
+            driver = uc.Chrome(
+                driver_executable_path=r"C:\chromedriver\chromedriver.exe",  # Adjust path as needed
+                options=chrome_options,
+                use_subprocess=True,
+                patcher=False
+            )
+
+            logger.info("Driver created for initial booking flow.")
+            driver.get(DVSA_APPLICATION_URL)
+            time.sleep(2)
+
+            # --- CAPTCHA/FIREWALL HANDLING ---
+            for _ in range(5):
+                status = check_firewall_and_queue(driver)
+                if status in ("queue", "firewall"):
+                    logger.info("Handling queue/firewall or recaptcha.")
+                    solved = solve_captcha(
+                        driver,
+                        skip=SOLVE_MANUALLY,
+                        coord_top_right=COORD_TOP_RIGHT,
+                        coord_bottom_left=COORD_BOTTOM_LEFT
+                    )
+                    if not solved:
+                        logger.warning("Captcha failed. Refreshing...")
                         driver.refresh()
-                    time.sleep(2)
-
-                # Step 1: Click 'Car (manual and automatic)' button
-                driver.find_element(By.ID, "test-type-car").click()
-                time.sleep(1)
-
-                # Step 2: Fill in licence number
-                input_text_box(driver, "driving-licence", licence_num)
-                time.sleep(1)
-
-                # Step 3: Select 'No special needs'
-                driver.find_element(By.ID, "special-needs-none").click()
-                time.sleep(0.5)
-
-                # Step 4: Click first 'Continue'
-                driver.find_element(By.ID, "driving-licence-submit").click()
-                time.sleep(3)
-
-                # ✅ Step 5: Fill in test date (one week from today)
-                future_date = (datetime.now() + timedelta(days=7)).strftime("%d/%m/%y")
-                logger.info("Entering preferred test date: %s", future_date)
-                input_text_box(driver, "test-choice-calendar", future_date)
-                time.sleep(1)
-
-                # ✅ Step 6: Click 'Continue' again (same ID as before)
-                driver.find_element(By.ID, "driving-licence-submit").click()
+                        time.sleep(3)
+                        continue
+                    else:
+                        break
+                elif status in ("ok", "login_required"):
+                    break
+                elif status == "error":
+                    logger.warning("Error page encountered. Refreshing.")
+                    time.sleep(3)
+                    driver.refresh()
                 time.sleep(2)
+            # --- End of CAPTCHA/FIREWALL HANDLING ---
 
-                # ✅ Step 7: Enter test centre postcode
-                logger.info("Entering postcode: %s", postcode)
-                input_text_box(driver, "test-centres-input", postcode)
-                time.sleep(1)
-
-                # ✅ Step 8: Click 'Find test centres'
-                driver.find_element(By.ID, "test-centres-submit").click()
-                time.sleep(3)
-
-                # ✅ Step 9: Click the Gateshead centre link
-                logger.info("Clicking Gateshead test centre link.")
-                if HALIFAX_TEST is True:
-                    driver.find_element(By.ID, "centre-name-184").click()
-                else:
-                    driver.find_element(By.ID, "centre-name-957").click()
-                time.sleep(3)
-
-                # ✅ Step 10: Click the first bookable date on the calendar
+            # --- NEW: Queue Handling (after captcha is solved) ---
+            while True:
                 try:
-                    logger.info("Looking for first bookable calendar date...")
+                    queue_elem = driver.find_element(By.ID, "MainPart_lbUsersInLineAheadOfYouText")
+                    if queue_elem.is_displayed():
+                        logger.info("Queue detected: %s", queue_elem.text)
+                        logger.info("Waiting in queue... checking again in 10 seconds.")
+                        time.sleep(10)
+                        # Do NOT refresh the page—just wait and re-check.
+                        continue
+                    else:
+                        break
+                except NoSuchElementException:
+                    break
+                except Exception as e:
+                    logger.error("Error during queue handling: %s", e)
+                    break
+            # --- End of Queue Handling ---
+
+            # --- NEW: Check for Oops Page ---
+            try:
+                oops_elem = driver.find_element(By.XPATH, "//*[contains(text(), 'Oops - you went away and came back again')]")
+                if oops_elem.is_displayed():
+                    logger.info("Detected Oops page. Clicking 'Continue' button to proceed.")
+                    continue_button = driver.find_element(By.XPATH, "//button[contains(text(), 'Continue')]")
+                    continue_button.click()
+                    time.sleep(2)
+            except NoSuchElementException:
+                logger.info("No Oops page detected. Proceeding with booking flow.")
+            except Exception as e:
+                logger.error("Error handling Oops page: %s", e)
+            # --- End of Oops Page Handling ---
+
+            # Step 1: Click 'Car (manual and automatic)' button
+            driver.find_element(By.ID, "test-type-car").click()
+            time.sleep(1)
+
+            # Step 2: Fill in licence number
+            input_text_box(driver, "driving-licence", licence_num)
+            time.sleep(1)
+
+            # Step 3: Select 'No special needs'
+            driver.find_element(By.ID, "special-needs-none").click()
+            time.sleep(0.5)
+
+            # Step 4: Click first 'Continue'
+            driver.find_element(By.ID, "driving-licence-submit").click()
+            time.sleep(3)
+
+            # Step 5: Fill in test date (for testing, set to a fixed date; otherwise, use one week from now)
+            future_date = "03/09/2025"
+            # Alternatively: future_date = (datetime.now() + timedelta(days=7)).strftime("%d/%m/%y")
+            logger.info("Entering preferred test date: %s", future_date)
+            input_text_box(driver, "test-choice-calendar", future_date)
+            time.sleep(1)
+
+            # Step 6: Click 'Continue' again (same ID as before)
+            driver.find_element(By.ID, "driving-licence-submit").click()
+            time.sleep(2)
+
+            # Step 7: Enter test centre postcode
+            logger.info("Entering postcode: %s", postcode)
+            input_text_box(driver, "test-centres-input", postcode)
+            time.sleep(1)
+
+            # Step 8: Click 'Find test centres'
+            driver.find_element(By.ID, "test-centres-submit").click()
+            time.sleep(3)
+
+            # Step 9: Click the test centre link (e.g., Gateshead or alternative)
+            logger.info("Clicking test centre link.")
+            if ALTERNATIVE_TEST is not None:
+                driver.find_element(By.ID, f"centre-name-{ALTERNATIVE_TEST[1]}").click()
+            else:
+                driver.find_element(By.ID, "centre-name-957").click()
+            time.sleep(3)
+
+            # --- Step 10: Click the first bookable date on the calendar with retries ---
+            found_bookable_date = False
+            max_date_retries = 30
+            for retry in range(max_date_retries):
+                try:
+                    logger.info("Looking for first bookable calendar date (attempt %d)...", retry + 1)
                     calendar_container = driver.find_element(By.CLASS_NAME, "BookingCalendar-datesBody")
                     bookable_days = calendar_container.find_elements(By.CLASS_NAME, "BookingCalendar-date--bookable")
 
                     if not bookable_days:
-                        logger.warning("No bookable dates available.")
+                        logger.warning("No bookable dates available on attempt %d.", retry + 1)
                         capture_screenshot(driver, label="no_bookable_dates")
-                        return
-
-                    # Click the first one
+                        wait_time = random.uniform(60, 600)
+                        logger.info("Waiting for %.2f seconds before refreshing...", wait_time)
+                        time.sleep(wait_time)
+                        driver.refresh()
+                        time.sleep(3)
+                        continue
+                    # Found at least one bookable day.
+                    found_bookable_date = True
                     first_day = bookable_days[0]
                     link = first_day.find_element(By.TAG_NAME, "a")
                     date_str = link.get_attribute("data-date")
                     logger.info("Clicking bookable date: %s", date_str)
                     link.click()
                     time.sleep(2)
-
+                    break
                 except Exception as exc:
-                    logger.error("Error clicking bookable calendar date: %s", exc)
+                    logger.error("Error in looking for bookable date on attempt %d: %s", retry + 1, exc)
                     capture_screenshot(driver, label="click_bookable_date_error")
+                    wait_time = random.uniform(10, 20)
+                    logger.info("Waiting for %.2f seconds before refreshing...", wait_time)
+                    time.sleep(wait_time)
+                    driver.refresh()
+                    time.sleep(3)
+            if not found_bookable_date:
+                logger.error("Failed to find any bookable date after %d attempts.", max_date_retries)
+                return
+
+            # Step 11: Choose an available slot
+            try:
+                logger.info("Looking for available slot...")
+                slot_labels = driver.find_elements(By.CSS_SELECTOR, "label.SlotPicker-slot-label.unchecked")
+                if not slot_labels:
+                    logger.warning("No available slots found.")
+                    capture_screenshot(driver, label="no_slot_found")
                     return
-
-                logger.info("Initial booking form submitted through to centre page.")
-
-                # Sleep to avoid spamming
-                random_sleep(DVSA_DELAY, 10)
-                break
-
+                # Click the first available slot
+                slot_labels[0].click()
+                time.sleep(1)
+                logger.info("Slot selected.")
             except Exception as exc:
-                logger.error("Top-level exception in initial booking attempt: %s", exc)
-                logger.debug(traceback.format_exc())
-                if driver:
-                    capture_screenshot(driver, label="initial_booking_exception")
-                time.sleep(5)
+                logger.error("Error choosing available slot: %s", exc)
+                capture_screenshot(driver, label="slot_choice_error")
+                return
 
-            finally:
-                if driver:
-                    try:
-                        driver.quit()
-                    except:
-                        pass
+            # Step 12: Click the continue button for the chosen slot
+            try:
+                logger.info("Clicking slot chosen continue button.")
+                driver.find_element(By.ID, "slot-chosen-submit").click()
+                time.sleep(1)
+            except Exception as exc:
+                logger.error("Error clicking slot chosen continue button: %s", exc)
+                capture_screenshot(driver, label="slot_continue_error")
+                return
 
-        else:
-            logger.info("Currently outside DVSA operational hours (%s - %s).", DVSA_OPEN_TIME, DVSA_CLOSE_TIME)
-            random_sleep(10, 5)
+            # Step 13: Click the confirm button
+            try:
+                logger.info("Clicking confirm button.")
+                driver.find_element(By.ID, "slot-warning-continue").click()
+                time.sleep(2)
+            except Exception as exc:
+                logger.error("Error clicking confirm button: %s", exc)
+                capture_screenshot(driver, label="confirm_button_error")
+                return
 
-        if attempt == MAX_ATTEMPTS - 1:
-            logger.info("Reached max attempts for initial booking flow. Exiting.")
+            logger.info("Initial booking form submitted through to centre page and slot confirmed.")
+
+            # Sleep to avoid spamming and then break out of the loop
+            random_sleep(DVSA_DELAY, 10)
+            break
+
+        except Exception as exc:
+            logger.error("Top-level exception in initial booking attempt: %s", exc)
+            logger.debug(traceback.format_exc())
+            if driver:
+                capture_screenshot(driver, label="initial_booking_exception")
+            time.sleep(5)
+
+        finally:
+            if driver:
+                try:
+                    driver.quit()
+                except:
+                    pass
+
+        attempt += 1
+
+    if attempt >= MAX_ATTEMPTS:
+        logger.info("Reached max attempts for initial booking flow. Exiting.")
+
+
+
+
+
 
 
 
