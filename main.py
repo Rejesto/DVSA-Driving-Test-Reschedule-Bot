@@ -604,8 +604,8 @@ def run_initial_booking_flow(config_data):
             time.sleep(3)
 
             # Step 5: Fill in test date (for testing, set to a fixed date; otherwise, use one week from now)
-            future_date = "03/09/2025"
-            # Alternatively: future_date = (datetime.now() + timedelta(days=7)).strftime("%d/%m/%y")
+            future_date = (datetime.now() + timedelta(days=14)).strftime("%d/%m/%y")
+
             logger.info("Entering preferred test date: %s", future_date)
             input_text_box(driver, "test-choice-calendar", future_date)
             time.sleep(1)
@@ -613,6 +613,10 @@ def run_initial_booking_flow(config_data):
             # Step 6: Click 'Continue' again (same ID as before)
             driver.find_element(By.ID, "driving-licence-submit").click()
             time.sleep(2)
+
+            # --- NEW: Save the current URL before entering the postcode ---
+            saved_url = driver.current_url
+            logger.info("Saved URL for test centre page: %s", saved_url)
 
             # Step 7: Enter test centre postcode
             logger.info("Entering postcode: %s", postcode)
@@ -643,10 +647,21 @@ def run_initial_booking_flow(config_data):
                     if not bookable_days:
                         logger.warning("No bookable dates available on attempt %d.", retry + 1)
                         capture_screenshot(driver, label="no_bookable_dates")
-                        wait_time = random.uniform(60, 600)
-                        logger.info("Waiting for %.2f seconds before refreshing...", wait_time)
+                        wait_time = random.uniform(10, 20)
+                        logger.info("Waiting for %.2f seconds before revisiting the test centre page...", wait_time)
                         time.sleep(wait_time)
-                        driver.refresh()
+                        # Instead of refreshing, revisit the saved URL and redo steps 7-9.
+                        driver.get(saved_url)
+                        time.sleep(3)
+                        logger.info("Re-entering postcode: %s", postcode)
+                        input_text_box(driver, "test-centres-input", postcode)
+                        time.sleep(1)
+                        driver.find_element(By.ID, "test-centres-submit").click()
+                        time.sleep(3)
+                        if ALTERNATIVE_TEST is not None:
+                            driver.find_element(By.ID, f"centre-name-{ALTERNATIVE_TEST[1]}").click()
+                        else:
+                            driver.find_element(By.ID, "centre-name-957").click()
                         time.sleep(3)
                         continue
                     # Found at least one bookable day.
@@ -659,12 +674,24 @@ def run_initial_booking_flow(config_data):
                     time.sleep(2)
                     break
                 except Exception as exc:
-                    logger.error("Error in looking for bookable date on attempt %d: %s", retry + 1, exc)
+                    logger.error("Error looking for bookable date on attempt %d: %s", retry + 1, exc)
                     capture_screenshot(driver, label="click_bookable_date_error")
                     wait_time = random.uniform(10, 20)
-                    logger.info("Waiting for %.2f seconds before refreshing...", wait_time)
+                    logger.info("Waiting for %.2f seconds before revisiting the test centre page...", wait_time)
                     time.sleep(wait_time)
-                    driver.refresh()
+                    driver.get(saved_url)
+                    time.sleep(3)
+                    logger.info("Re-entering postcode: %s", postcode)
+                    element = driver.find_element(By.ID, "test-centres-input")
+                    element.clear()
+                    input_text_box(driver, "test-centres-input", postcode)
+                    time.sleep(1)
+                    driver.find_element(By.ID, "test-centres-submit").click()
+                    time.sleep(3)
+                    if ALTERNATIVE_TEST is not None:
+                        driver.find_element(By.ID, f"centre-name-{ALTERNATIVE_TEST[1]}").click()
+                    else:
+                        driver.find_element(By.ID, "centre-name-957").click()
                     time.sleep(3)
             if not found_bookable_date:
                 logger.error("Failed to find any bookable date after %d attempts.", max_date_retries)
