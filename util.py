@@ -5,6 +5,7 @@ import time
 import random
 import logging
 import requests
+import csv
 
 from configparser import ConfigParser
 from datetime import datetime, timedelta
@@ -166,6 +167,7 @@ def solve_captcha(
     Attempts to handle the Imperva/hCaptcha. If skip=True, user solves manually.
     Returns True if we think it's solved or not present, False otherwise.
     """
+    logger.info("Attempting to solve captcha.")
     if skip:
         logger.info("Manual captcha mode. Please solve hCaptcha manually.")
         time.sleep(60)
@@ -186,7 +188,9 @@ def solve_captcha(
             )
             time.sleep(random.uniform(1.5, 2.5))
 
-        # Return True so we can proceed
+        if "blorga" not in page_source:
+            logger.info("Blorga was not in page source. Returning/")
+            return False
         return True
 
     except Exception as exc:
@@ -419,3 +423,51 @@ def book_test_flow(
     else:
         logger.info("AUTO_BOOK_TEST=False. Stopping before final confirmation.")
         return True
+
+def are_we_in(driver):
+    try:
+        if driver.find_element(By.ID, "MainPart_lbUsersInLineAheadOfYouText"):
+            logger.info("1")
+            return True
+    except NoSuchElementException:
+        pass
+
+    try:
+        if driver.find_element(By.XPATH, "//*[contains(text(), 'Oops - you went away and came back again')]"):
+            logger.info("2")
+            return True
+    except NoSuchElementException:
+        pass
+
+    try:
+        if driver.find_element(By.ID, "test-type-car"):
+            logger.info("3")
+            return True
+    except NoSuchElementException:
+        pass
+
+    return False
+
+
+def log_test_centre_availability(driver, csv_filename="test_centre_availability_log.csv"):
+    try:
+        centres = driver.find_elements(By.CLASS_NAME, "test-centre-details")
+        if not centres:
+            logger.warning("No test centre details found on page.")
+            return
+
+        with open(csv_filename, mode='a', newline='', encoding='utf-8') as file:
+            writer = csv.writer(file)
+            for centre in centres:
+                try:
+                    centre_name = centre.find_element(By.TAG_NAME, "h2").text.strip()
+                    status_text = centre.find_element(By.TAG_NAME, "h5").text.strip()
+                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    writer.writerow([timestamp, centre_name, status_text])
+                    logger.info("Logged test centre: %s - %s", centre_name, status_text)
+                except NoSuchElementException:
+                    logger.warning("Test centre entry missing expected h2 or h5 tags.")
+                    continue
+
+    except Exception as e:
+        logger.error("Error while logging test centre availability: %s", e)

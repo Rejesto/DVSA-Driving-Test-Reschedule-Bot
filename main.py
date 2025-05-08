@@ -10,7 +10,6 @@ from configparser import ConfigParser
 from datetime import datetime
 from datetime import timedelta
 from datetime import time as dtime
-from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.common.exceptions import NoSuchElementException
 from selenium.webdriver.chrome.service import Service
@@ -29,11 +28,15 @@ from util import (
     book_test_flow,
     send_text_available,
     send_text_test_found,
+    are_we_in,
+    log_test_centre_availability
 )
 
 ###############################################################################
 #                           CONFIG & GLOBALS                                  #
 ###############################################################################
+
+DRIVER_EXECUTABLE_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)), "chromedriver", "chromedriver_win.exe")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,6 +59,8 @@ BOOKING_MODE = CONFIG.get("preferences", "booking_mode", fallback="reschedule").
 
 BUSTER_ENABLED = False
 BUSTER_PATH = os.path.join(CURRENT_PATH, "buster-chrome.zip")
+
+MANUALLY_SOLVING_HANG = True
 
 DVSA_QUEUE_URL = (
     "https://queue.driverpracticaltest.dvsa.gov.uk/"
@@ -128,9 +133,9 @@ class DVSABot:
 
         print("Using Chrome binary:", chrome_options.binary_location)
         print("Shouldn't try and download!")
-        # 👇 Use your manually downloaded chromedriver.exe
+        # 👇 Use your manually downloaded chromedriver_win.exe
         self.driver = uc.Chrome(
-            driver_executable_path=r"C:\chromedriver\chromedriver.exe",  # your local chromedriver
+            driver_executable_path=DRIVER_EXECUTABLE_PATH,  # your local chromedriver
             options=chrome_options,
             use_subprocess=True,
             patcher=False
@@ -517,7 +522,7 @@ def run_initial_booking_flow(config_data):
 
             # Launch the driver using your local chromedriver and disable patching.
             driver = uc.Chrome(
-                driver_executable_path=r"C:\chromedriver\chromedriver.exe",  # Adjust path as needed
+                driver_executable_path=DRIVER_EXECUTABLE_PATH,  # Adjust path as needed
                 options=chrome_options,
                 use_subprocess=True,
                 patcher=False
@@ -528,6 +533,7 @@ def run_initial_booking_flow(config_data):
             time.sleep(2)
 
             # --- CAPTCHA/FIREWALL HANDLING ---
+            continue_flag = False
             for _ in range(5):
                 status = check_firewall_and_queue(driver)
                 if status in ("queue", "firewall"):
@@ -538,10 +544,26 @@ def run_initial_booking_flow(config_data):
                         coord_top_right=COORD_TOP_RIGHT,
                         coord_bottom_left=COORD_BOTTOM_LEFT
                     )
-                    if not solved:
-                        logger.warning("Captcha failed. Refreshing...")
-                        driver.refresh()
-                        time.sleep(3)
+
+                    logger.info(f"Solved Status was {status}.")
+
+
+                    if solved is not True:
+                        if MANUALLY_SOLVING_HANG:
+                            logger.info("Solving manually.")
+                            while True:
+                                if are_we_in(driver):
+                                    logger.info("Captcha was solved manually.")
+                                    continue_flag = True
+                                    break
+                                logger.info("Captcha has not yet been solved manually.")
+                                random_sleep(5, 5)
+
+                        else:
+                            logger.warning("Captcha failed. Refreshing...")
+                            driver.refresh()
+                            time.sleep(3)
+
                         continue
                     else:
                         break
@@ -658,6 +680,8 @@ def run_initial_booking_flow(config_data):
                         time.sleep(1)
                         driver.find_element(By.ID, "test-centres-submit").click()
                         time.sleep(3)
+                        log_test_centre_availability(driver)
+
                         if ALTERNATIVE_TEST is not None:
                             driver.find_element(By.ID, f"centre-name-{ALTERNATIVE_TEST[1]}").click()
                         else:
@@ -686,6 +710,8 @@ def run_initial_booking_flow(config_data):
                     element.clear()
                     input_text_box(driver, "test-centres-input", postcode)
                     time.sleep(1)
+                    log_test_centre_availability(driver)
+
                     driver.find_element(By.ID, "test-centres-submit").click()
                     time.sleep(3)
                     if ALTERNATIVE_TEST is not None:
@@ -738,6 +764,8 @@ def run_initial_booking_flow(config_data):
 
             # Sleep to avoid spamming and then break out of the loop
             random_sleep(DVSA_DELAY, 10)
+            if MANUALLY_SOLVING_HANG:
+                random_sleep(500, 10)
             break
 
         except Exception as exc:
