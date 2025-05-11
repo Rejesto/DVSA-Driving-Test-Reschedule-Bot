@@ -58,6 +58,7 @@ def parse_config(config: ConfigParser) -> dict:
             "after-date": after_date_str,
             "auto_book_test": auto_book_bool,
             "formatted_current_test_date": formatted_current_test_date_str,
+            "minimum_days_notice": int(kwargs.get('minimum_days_notice', 0)),
         }
 
     key_dict = {}
@@ -150,6 +151,7 @@ def input_text_box(driver: webdriver.Chrome, box_id: str, text_to_type: str):
     """
     try:
         box = driver.find_element(By.ID, box_id)
+        box.clear()
         for char in text_to_type:
             box.send_keys(char)
             time.sleep(random.uniform(0.01, 0.05))
@@ -226,6 +228,12 @@ def check_firewall_and_queue(driver: webdriver.Chrome) -> str:
     if "oops" in page_source:
         return "error"
 
+    if "please stand by" in page_source:
+        return "waiting"
+
+    if "date and time of test" in page_source:
+        return "reschedule_page"
+
     # 5) Otherwise, we assume it's OK
     return "ok"
 
@@ -236,7 +244,8 @@ def scan_for_preferred_tests(
     after_date_str: str,
     unavailable_dates: list,
     current_test_date: str,
-    formatted_test_date: str
+    formatted_test_date: str,
+    minimum_days_notice: int = 0
 ):
     """
     Searches the DVSA calendar for a date that meets:
@@ -245,58 +254,121 @@ def scan_for_preferred_tests(
       - date not in unavailable_dates
       - not the same as your existing test date
       - a weekday (Mon-Fri)
+      - at least `minimum_days_notice` days away from today
     Returns (found: bool, date_str: str or None, date_element: WebElement or None).
     """
-    def parse_or_default(date_string: str, default: str):
-        """Attempt to parse a date string or return a default date."""
+
+    def parse_input_date(date_string: str, fallback: str):
         if not date_string or date_string == "None":
-            return datetime.strptime(default, "%Y-%m-%d")
-        return datetime.strptime(date_string, "%Y-%m-%d")
+            logger.debug("Using fallback date: %s", fallback)
+            return datetime.strptime(fallback, "%Y-%m-%d")
+        try:
+            return datetime.strptime(date_string, "%d/%m/%Y")
+        except ValueError:
+            return datetime.strptime(date_string, "%Y-%m-%d")
 
     try:
-        # If "Yes" in current_test_date, treat that as no real date
-        if current_test_date and "Yes" in current_test_date:
-            min_date = datetime.strptime("2050-12-12", "%Y-%m-%d")
-        else:
-            # E.g. "Wednesday 15 December 2025 2:43PM"
+        logger.info("")
+        logger.info("")
+        logger.info("Starting scan for preferred test dates...")
+
+        # Parse config dates
+        parsed_before = parse_input_date(before_date_str, "2050-12-12")
+        parsed_after = parse_input_date(after_date_str, "2000-01-01")
+        logger.info("User's before-date: %s, after-date: %s", parsed_before, parsed_after)
+
+        # Parse current test date
+        try:
+            dt_current_test = None
+            for fmt in ("%A %d %B %Y %I:%M%p", "%d/%m/%Y %H:%M", "%Y-%m-%d", "%d/%m/%Y"):
+                try:
+                    dt_current_test = datetime.strptime(current_test_date, fmt)
+                    logger.info("Parsed current test date (%s) using format: %s", dt_current_test, fmt)
+                    break
+                except ValueError:
+                    continue
+
+            if not dt_current_test:
+                logger.warning("Could not parse current test date: %s", current_test_date)
+
+            logger.info("Parsed current test date as: %s", dt_current_test)
+        except Exception as e:
+            logger.warning("Could not parse current test date. Will compare using formatted string. (%s)", e)
+            dt_current_test = None
+
+        # Calendar date range
+        min_date = parsed_before
+        max_date = parsed_after
+        logger.debug("Final scan range: looking for dates between %s and %s", max_date, min_date)
+
+        try:
+            cal_body = driver.find_element(By.CLASS_NAME, "BookingCalendar-datesBody")
+            days = cal_body.find_elements(By.XPATH, ".//td")
+            logger.info("Found %d days in calendar to scan.", len(days))
+
+        except NoSuchElementException:
             try:
-                dt_current_test = datetime.strptime(current_test_date, "%A %d %B %Y %I:%M%p")
-                min_date = dt_current_test - timedelta(days=1)
-            except:
-                min_date = datetime.strptime("2050-12-12", "%Y-%m-%d")
+                # Check if "no tests available" paragraph is present
+                no_dates_msg = driver.find_element(
+                    By.XPATH,
+                    "//p[contains(text(), 'There are no tests that meet your requirements')]"
+                )
+                if no_dates_msg.is_displayed():
+                    logger.info("No test dates available for current centre. Message found on page.")
+                    return False, None, None
+            except NoSuchElementException:
+                logger.error("Calendar not found and no 'no dates' message. Unexpected page state.")
+                return False, None, None
 
-        # If we have an explicit before_date, override
-        if before_date_str and before_date_str != "None":
-            parsed_before = datetime.strptime(before_date_str, "%Y-%m-%d")
-            if parsed_before < min_date:
-                min_date = parsed_before
-
-        max_date = parse_or_default(after_date_str, "2000-01-01")
-
-        cal_body = driver.find_element(By.CLASS_NAME, "BookingCalendar-datesBody")
-        days = cal_body.find_elements(By.XPATH, ".//td")
-
+        today = datetime.now().date()
         if not unavailable_dates:
             unavailable_dates = []
 
         for day in days:
             cls = day.get_attribute("class") or ""
-            if "--unavailable" not in cls:
-                try:
-                    link_el = day.find_element(By.XPATH, ".//a")
-                    link_date_str = link_el.get_attribute("data-date")
-                    link_date_dt = datetime.strptime(link_date_str, "%Y-%m-%d")
+            if "--unavailable" in cls:
+                continue
 
-                    if (
-                        link_date_str not in unavailable_dates
-                        and link_date_dt < min_date
-                        and link_date_dt > max_date
-                        and link_date_dt.weekday() < 5
-                        and link_date_str != formatted_test_date
-                    ):
-                        return True, link_date_str, link_el
-                except NoSuchElementException:
-                    pass
+            try:
+                link_el = day.find_element(By.XPATH, ".//a")
+                link_date_str = link_el.get_attribute("data-date")  # Format: YYYY-MM-DD
+                link_date_dt = datetime.strptime(link_date_str, "%Y-%m-%d")
+                logger.debug("Evaluating date: %s", link_date_str)
+
+                if link_date_str in unavailable_dates:
+                    logger.debug("Date %s is in unavailable list. Skipping.", link_date_str)
+                    continue
+
+                if not (max_date < link_date_dt < min_date):
+                    logger.debug("Date %s is outside preferred range. Skipping.", link_date_dt)
+                    continue
+
+                if dt_current_test and link_date_dt.date() == dt_current_test.date():
+                    logger.debug("Date %s matches current test. Skipping.", link_date_dt)
+                    continue
+
+                if link_date_str == formatted_test_date:
+                    logger.debug("Date %s matches formatted current test date. Skipping.", link_date_str)
+                    continue
+
+                if link_date_dt.weekday() >= 5:
+                    logger.debug("Date %s is on a weekend. Skipping.", link_date_dt)
+                    continue
+
+                days_until = (link_date_dt.date() - today).days
+                if days_until < minimum_days_notice:
+                    logger.debug("Date %s is only %d days away (< %d days notice). Skipping.",
+                                 link_date_dt, days_until, minimum_days_notice)
+                    continue
+
+                logger.info("✅ Suitable date found: %s", link_date_str)
+                return True, link_date_str, link_el
+
+            except NoSuchElementException:
+                logger.warning("Expected <a> element not found in calendar cell.")
+                continue
+
+        logger.info("No preferred test dates found in this calendar scan.")
         return False, None, None
 
     except NoSuchElementException as exc:
@@ -305,6 +377,8 @@ def scan_for_preferred_tests(
     except Exception as exc:
         logger.error("Error scanning for tests: %s", exc)
         return False, None, None
+
+
 
 
 def book_test_flow(
@@ -442,6 +516,13 @@ def are_we_in(driver):
     try:
         if driver.find_element(By.ID, "test-type-car"):
             logger.info("3")
+            return True
+    except NoSuchElementException:
+        pass
+
+    try:
+        if driver.find_element(By.XPATH, '//label[@for="driving-licence-number"]'):
+            logger.info("Label for driving licence number found.")
             return True
     except NoSuchElementException:
         pass

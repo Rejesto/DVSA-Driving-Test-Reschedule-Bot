@@ -36,7 +36,8 @@ from util import (
 #                           CONFIG & GLOBALS                                  #
 ###############################################################################
 
-DRIVER_EXECUTABLE_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)), "chromedriver", "chromedriver_win.exe")
+DRIVER_EXECUTABLE_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)), "chromedriver",
+                                      "chromedriver_win.exe")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -77,7 +78,7 @@ SOLVE_MANUALLY = False
 RUN_ON_VM = False
 
 DVSA_OPEN_TIME = dtime(6, 0, 30)
-DVSA_CLOSE_TIME = dtime(21, 35)
+DVSA_CLOSE_TIME = dtime(21, 50)
 
 # Coordinates used for hardware click puzzle
 COORD_TOP_RIGHT = (820, 420)
@@ -104,6 +105,11 @@ class DVSABot:
         self.driver = None
         self.active = False
         self.current_centre_index = 0
+
+        self.current_test_date_obj = None
+        self.current_test_date_str = None
+
+        print("Initializing DVSABot with preferences:", preferences)
 
     def setup_driver(self):
         chrome_options = uc.ChromeOptions()
@@ -168,53 +174,70 @@ class DVSABot:
         logger.info("Credentials entered.")
 
     def handle_queue_and_firewall(self):
-        """(Unchanged) handle queue & Imperva for the reschedule flow."""
-        max_queue_checks = 100
-        loop_count = 0
+        """Updated queue & firewall handling using modern CAPTCHA logic with logging."""
+        continue_flag = False
+        logger.info("Starting queue and firewall handling...")
 
-        while loop_count < max_queue_checks:
+        for attempt in range(5):
+            logger.info("Queue/firewall check attempt %d", attempt + 1)
             status = check_firewall_and_queue(self.driver)
-            if status == "queue":
-                logger.info("DVSA queue active; waiting a bit. (loop_count=%d)", loop_count)
-                random_sleep(0.5, 1.5)
-                loop_count += 1
-                continue
+            logger.info("Firewall/queue check returned status: %s", status)
 
-            if status == "firewall":
-                logger.warning("Imperva firewall encountered. Attempting fix.")
-                random_sleep(0.5, 2.5)
+            if status in ("queue", "firewall"):
+                logger.info("Encountered '%s'. Initiating CAPTCHA handling.", status)
+
                 solved = solve_captcha(
                     self.driver,
                     skip=SOLVE_MANUALLY,
                     coord_top_right=COORD_TOP_RIGHT,
                     coord_bottom_left=COORD_BOTTOM_LEFT
                 )
-                if solved:
-                    time.sleep(3)
-                    if check_firewall_and_queue(self.driver) == "firewall":
-                        logger.warning("Still behind firewall after captcha. Extra delay 3min.")
-                        random_sleep(180, 10)
+                logger.info("CAPTCHA solve attempt result: %s", solved)
+
+                if not solved:
+                    if MANUALLY_SOLVING_HANG:
+                        logger.info("Manual solving enabled. Waiting for user to solve CAPTCHA manually.")
+                        while True:
+                            if are_we_in(self.driver):
+                                logger.info("User has manually solved CAPTCHA.")
+                                continue_flag = True
+                                break
+                            logger.info("Still waiting for manual CAPTCHA solution...")
+                            random_sleep(5, 5)
+                    else:
+                        logger.warning("CAPTCHA not solved. Refreshing the page to retry.")
+                        self.driver.refresh()
+                        time.sleep(3)
+
+                    if continue_flag:
+                        logger.info("Breaking out after manual solve.")
+                        break
+
+                    logger.info("Retrying firewall/queue logic after unsuccessful solve.")
+                    continue
                 else:
-                    logger.warning("Captcha not solved; continuing attempts.")
+                    logger.info("CAPTCHA solved successfully.")
+                    break
+
+            elif status in ("ok", "login_required"):
+                logger.info("Firewall clear. Proceeding with login flow. Status: %s", status)
+                break
+
+            elif status == "error":
+                logger.warning("Error page encountered. Refreshing page.")
+                time.sleep(3)
                 self.driver.refresh()
 
-            elif status == "login_required":
-                logger.info("Reached login page.")
-                break
-            elif status == "error":
-                logger.error("DVSA error page. Possibly 'Oops'. Breaking out.")
-                break
-            elif status == "ok":
-                logger.info("Queue/firewall checks are all clear.")
-                break
+            time.sleep(2)
 
-        if loop_count >= max_queue_checks:
-            logger.error("Queue max time exceeded. Attempting fallback refresh.")
-            self.driver.refresh()
+        logger.info("Finished queue/firewall handling routine.")
 
     def login(self):
         """
-        The login step for the *reschedule* flow.
+        Logs into DVSA by:
+          1. Getting through the firewall/queue.
+          2. Entering user credentials.
+        Does NOT continue to booking logic.
         """
         if not self.driver:
             self.setup_driver()
@@ -222,199 +245,294 @@ class DVSABot:
         logger.info("Navigating to DVSA queue URL: %s", DVSA_QUEUE_URL)
         self.driver.get(DVSA_QUEUE_URL)
 
-        # Step 1: handle queue/firewall
+        # Step 1: pass firewall/queue
         self.handle_queue_and_firewall()
 
-        # Step 2: enter credentials
+        # Step 2: enter login credentials
         self.enter_reschedule_credentials(manual=False)
 
-        # Step 3: check firewall again
-        status = check_firewall_and_queue(self.driver)
-        if status == "firewall":
-            logger.warning("Firewall triggered after login attempt.")
-            random_sleep(2, 5)
-            solved = solve_captcha(
-                self.driver,
-                skip=SOLVE_MANUALLY,
-                coord_top_right=COORD_TOP_RIGHT,
-                coord_bottom_left=COORD_BOTTOM_LEFT
-            )
-            if solved:
-                time.sleep(3)
-                status = check_firewall_and_queue(self.driver)
-                if status == "firewall":
-                    logger.warning("Still behind firewall. 20s delay.")
-                    random_sleep(20, 4)
-            else:
-                logger.warning("Captcha not solved on second attempt.")
-            self.driver.refresh()
+        # Step 3: firewall may appear again after form submission
+        self.handle_queue_and_firewall()
 
+        # Step 4: check for login error
         if "loginError=true" in self.driver.current_url:
             logger.error("Incorrect licence/booking reference. Marking inactive.")
             self.active = False
             return
 
-        # Step 4: parse booking summary
-        try:
-            contents = self.driver.find_elements(By.CLASS_NAME, "contents")
-            if len(contents) >= 2:
-                test_date_temp = contents[0].find_element(By.XPATH, ".//dd").text
-                test_center_temp = contents[1].find_element(By.XPATH, ".//dd").text
-                logger.info("Current test date: %s", test_date_temp)
-                logger.info("Current test center: %s", test_center_temp)
-            else:
-                test_date_temp = ""
-                test_center_temp = ""
-                logger.warning("Could not parse booking summary. Possibly unusual page layout.")
-
-            if "Your booking has been cancelled." in self.driver.page_source:
-                logger.warning("Booking was cancelled. Marking inactive.")
-                self.active = False
-                return
-
-            # If user indicated "Yes" in current date => earliest test scenario
-            if "Yes" in self.preferences["current-test"]["date"]:
-                logger.info("Earliest test scenario. Changing date/time to earliest.")
-                self.driver.find_element(By.ID, "date-time-change").click()
-                random_sleep(1, 2)
-                self.driver.find_element(By.ID, "test-choice-earliest").click()
-                random_sleep(1, 2)
-                self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                random_sleep(1, 2)
-                self.driver.find_element(By.ID, "driving-licence-submit").click()
-
-                if test_center_temp:
-                    self.preferences["center"] = [test_center_temp]
-                random_sleep(1, 2)
-            else:
-                logger.info("Going to 'test-centre-change' flow.")
-                self.driver.find_element(By.ID, "test-centre-change").click()
-                random_sleep(3, 2)
-                search_box = self.driver.find_element(By.ID, "test-centres-input")
-                search_box.clear()
-                if self.preferences["center"]:
-                    input_text_box(self.driver, "test-centres-input", self.preferences["center"][0])
-                else:
-                    logger.warning("No center preference found in config.")
-                self.driver.find_element(By.ID, "test-centres-submit").click()
-                random_sleep(5, 2)
-
-                results_container = self.driver.find_element(By.CLASS_NAME, "test-centre-results")
-                first_link = results_container.find_element(By.XPATH, ".//a")
-                first_link.click()
-
-            final_status = check_firewall_and_queue(self.driver)
-            if final_status in ("firewall", "queue", "error", "login_required"):
-                logger.warning("Page ended in state '%s'. Marking inactive.", final_status)
-                self.active = False
-            else:
-                self.active = True
-
-        except Exception as exc:
-            logger.error("Error parsing post-login summary: %s", exc)
-            self.active = False
+        self.active = True
 
     def search_and_book(self):
-        """
-        The step that checks for earlier tests and tries to re-book.
-        (reschedule flow).
-        """
         if not self.active:
             logger.info("Bot not active; skipping search.")
-            return
+            return False
+
+        logger.info("Waiting for reschedule page to become active...")
+        for _ in range(30):
+            status = check_firewall_and_queue(self.driver)
+            if status == "reschedule_page":
+                logger.info("Reschedule page detected.")
+                break
+            logger.info("Still waiting for reschedule page... (%s)", status)
+            time.sleep(2)
+        else:
+            logger.warning("Reschedule page did not load in time. Marking inactive.")
+            self.active = False
+            return False
+
+        try:
+            logger.info("Extracting current test date from reschedule summary panel...")
+            date_panel = self.driver.find_element(By.CLASS_NAME, "contents")
+            raw_date_text = date_panel.find_element(By.XPATH, ".//dd").text.strip()
+            logger.info("Found test date string: '%s'", raw_date_text)
+            self.current_test_date_str = raw_date_text
+
+            # Try parsing into a datetime object
+            for fmt in ("%A %d %B %Y %I:%M%p", "%d/%m/%Y %H:%M", "%Y-%m-%d", "%d/%m/%Y"):
+                try:
+                    self.current_test_date_obj = datetime.strptime(raw_date_text, fmt)
+                    logger.info("Parsed current test date: %s", self.current_test_date_obj)
+                    break
+                except ValueError:
+                    continue
+
+            if not self.current_test_date_obj:
+                logger.warning("Unable to parse current test date. Storing raw string only.")
+        except Exception as e:
+            logger.warning("Failed to extract current test date: %s", e)
+
+        # Submit 'earliest test' option
+        try:
+            logger.info("Submitting earliest test option.")
+            logger.info("Clicking 'earliest test' button.")
+            self.driver.find_element(By.ID, "date-time-change").click()
+            random_sleep(1, 2)
+            logger.info("Clicking 'earliest test' radio button.")
+            self.driver.find_element(By.ID, "test-choice-earliest").click()
+
+            random_sleep(1, 2)
+            logger.info("Clicking 'Continue' button.")
+            self.driver.find_element(By.ID, "driving-licence-submit").click()
+        except Exception as e:
+            logger.error("Failed to submit earliest test choice: %s", e)
+            self.active = False
+            return False
 
         centres = self.preferences.get("center", [])
         if not centres:
             logger.warning("No test centres specified in preferences.")
-            return
+            self.reset_reschedule()
+            return False
 
-        driver = self.driver
-        search_centre_idx = self.current_centre_index
         self.current_centre_index = (self.current_centre_index + 1) % len(centres)
-        centre_to_search = centres[search_centre_idx]
+        centre_to_search = centres[self.current_centre_index - 1]
 
-        try:
-            logger.info("Switching test centre to '%s'", centre_to_search)
-            driver.find_element(By.ID, "change-test-centre").click()
-            random_sleep(2, 2)
+        if not self.check_centre_for_tests(centre_to_search):
+            logger.info("No tests available at centre '%s'.", centre_to_search)
+            random_sleep(80, 220)
+            self.reset_reschedule()
+            return False
 
-            search_box = driver.find_element(By.ID, "test-centres-input")
-            search_box.clear()
-            input_text_box(driver, "test-centres-input", centre_to_search)
-            driver.find_element(By.ID, "test-centres-submit").click()
-            random_sleep(5, 2)
-
-            results_container = driver.find_element(By.CLASS_NAME, "test-centre-results")
-            link = results_container.find_element(By.XPATH, ".//a")
-            link.click()
-            random_sleep(3, 2)
-
-        except NoSuchElementException:
-            logger.error("Could not change test center or find results.")
-            status = check_firewall_and_queue(driver)
-            if status in ("error", "queue", "firewall", "login_required"):
-                logger.warning("Encountered '%s'. Marking inactive.", status)
-                self.active = False
-            return
-        except Exception as exc:
-            logger.error("Error while changing centre: %s", exc)
-            self.active = False
-            return
-
-        if not self.active:
-            return
-
-        page_source = driver.page_source.lower()
-        if "there are no tests available" in page_source:
-            logger.info("No test available at centre '%s'", centre_to_search)
-            return
-        status = check_firewall_and_queue(driver)
-        if status != "ok":
-            logger.warning("Detected status '%s' after selecting centre. Marking inactive.", status)
-            self.active = False
-            return
-
-        logger.info("Tests appear available, scanning for suitable dates.")
         found, found_date_str, date_el = scan_for_preferred_tests(
-            driver=driver,
+            driver=self.driver,
             before_date_str=self.preferences.get("before-date"),
             after_date_str=self.preferences.get("after-date"),
             unavailable_dates=self.preferences.get("disabled-dates", []),
             current_test_date=self.preferences["current-test"]["date"],
-            formatted_test_date=FORMATTED_CURRENT_TEST_DATE
+            formatted_test_date=FORMATTED_CURRENT_TEST_DATE,
+            minimum_days_notice=self.preferences.get("minimum_days_notice", 0)
         )
+        logger.info("Scan result: %s", [found, found_date_str, date_el])
 
         if not found:
-            logger.info("No preferred test dates found at this time.")
-            return
+            logger.info("No preferred test dates found.")
+            self.reset_reschedule()
+            return False
 
         try:
-            from datetime import datetime
+            min_notice_days = int(self.preferences.get("minimum_days_notice", 0))
+            test_date = datetime.strptime(found_date_str, "%Y-%m-%d")
+            days_until_test = (test_date - datetime.now()).days
 
-            target_dt = datetime.strptime(found_date_str, "%Y-%m-%d")
-            attempts = 0
-            while attempts < 12:
-                current_month = driver.find_element(By.CLASS_NAME, "BookingCalendar-currentMonth").text
-                if target_dt.strftime("%B") == current_month:
-                    break
+            if days_until_test < min_notice_days:
+                logger.info("Test is only %d days away, which is less than minimum of %d. Skipping booking.",
+                            days_until_test, min_notice_days)
+                self.reset_reschedule()
+                return False
+        except Exception as exc:
+            logger.warning("Failed to apply days notice check: %s", exc)
+
+        self.attempt_booking(found_date_str, date_el, centre_to_search)
+        return True
+
+    def reset_reschedule(self):
+        """
+        Navigates back to the original booking screen.
+        """
+        logger.info("Resetting by returning to original booking screen...")
+        try:
+            return_link = self.driver.find_element(By.ID, "return-original-booking-link")
+            return_link.click()
+            time.sleep(2)
+            logger.info("Successfully clicked return to booking link.")
+        except NoSuchElementException:
+            logger.error("Return to booking link not found.")
+        except Exception as e:
+            logger.error("Failed during reset: %s", e)
+
+        logger.info("Reset complete. Waiting for 5 seconds before next attempt.")
+        time.sleep(5)
+        self.search_and_book()
+
+    def change_test_centre(self, centre_to_search):
+        try:
+            logger.info("Switching test centre to '%s'", centre_to_search)
+            self.driver.find_element(By.ID, "change-test-centre").click()
+            random_sleep(2, 2)
+
+            search_box = self.driver.find_element(By.ID, "test-centres-input")
+            search_box.clear()
+            input_text_box(self.driver, "test-centres-input", centre_to_search)
+            self.driver.find_element(By.ID, "test-centres-submit").click()
+            random_sleep(5, 2)
+
+            results_container = self.driver.find_element(By.CLASS_NAME, "test-centre-results")
+            link = results_container.find_element(By.XPATH, ".//a")
+            link.click()
+            random_sleep(3, 2)
+            return True
+
+        except NoSuchElementException:
+            logger.error("Could not change test center or find results.")
+            status = check_firewall_and_queue(self.driver)
+            if status in ("error", "queue", "firewall", "login_required"):
+                logger.warning("Encountered '%s'. Marking inactive.", status)
+                self.active = False
+            return False
+        except Exception as exc:
+            logger.error("Error while changing centre: %s", exc)
+            self.active = False
+            return False
+
+    def check_centre_for_tests(self, centre_to_search):
+        """
+        Scans the booking calendar for available test dates.
+        If no valid dates are available in the current or previous month, initiates reset.
+        """
+        logger.info("Checking calendar for available test dates at '%s'...", centre_to_search)
+
+        try:
+            calendar_body = self.driver.find_element(By.CLASS_NAME, "BookingCalendar-datesBody")
+
+            all_bookable = calendar_body.find_elements(By.CLASS_NAME, "BookingCalendar-date--bookable")
+            # Filter out dates that are already selected (e.g., 'is-chosen')
+            valid_bookable = []
+            for el in all_bookable:
+                cls = el.get_attribute("class")
+                if "is-chosen" in cls:
+                    continue  # Skip selected
                 try:
-                    driver.find_element(By.CLASS_NAME, "BookingCalendar-nav--prev").click()
-                except NoSuchElementException:
-                    logger.warning("Could not navigate calendar to previous month.")
-                    break
-                random_sleep(0.1, 0.2)
-                attempts += 1
+                    date_link = el.find_element(By.TAG_NAME, "a")
+                    date_str = date_link.get_attribute("data-date")
+                    if self.current_test_date_obj and date_str == self.current_test_date_obj.strftime("%Y-%m-%d"):
+                        logger.debug("Skipping already booked test date: %s", date_str)
+                        continue
+                    valid_bookable.append(el)
+                except Exception as e:
+                    logger.warning("Failed to process bookable element: %s", e)
+                    continue
 
-            # Select date
+            logger.info("Found %d total bookable days, %d valid (non-chosen) bookable days.",
+                        len(all_bookable), len(valid_bookable))
+
+            if valid_bookable:
+                logger.info("Valid test dates available.")
+                logger.info("Dates: %s",
+                            [el.find_element(By.TAG_NAME, "a").get_attribute("data-date") for el in valid_bookable])
+                return True
+
+            # No valid bookable dates — check previous month
+            try:
+                prev_month_button = self.driver.find_element(By.CLASS_NAME, "BookingCalendar-nav--prev")
+                if "is-active" in prev_month_button.get_attribute("class"):
+                    logger.info("No valid dates this month. Going to previous month...")
+                    prev_month_button.click()
+                    time.sleep(2)
+                else:
+                    logger.warning("Previous month button not active. Cannot check earlier dates.")
+                    self.reset_reschedule()
+                    return False
+            except NoSuchElementException:
+                logger.warning("Previous month navigation button not found.")
+                self.reset_reschedule()
+                return False
+
+            # Check for "no earlier tests" message
+            page_source = self.driver.page_source.lower()
+            if "there are no earlier tests available" in page_source:
+                logger.info("Message indicates no earlier tests available.")
+                random_sleep(80, 120)
+                self.reset_reschedule()
+                return False
+
+            # Re-check calendar in previous month
+            calendar_body = self.driver.find_element(By.CLASS_NAME, "BookingCalendar-datesBody")
+            all_bookable = calendar_body.find_elements(By.CLASS_NAME, "BookingCalendar-date--bookable")
+            valid_bookable = [
+                el for el in all_bookable
+                if "is-chosen" not in el.get_attribute("class")
+            ]
+
+            logger.info("In previous month: %d total bookable, %d valid.", len(all_bookable), len(valid_bookable))
+
+            if valid_bookable:
+                return True
+            else:
+                logger.info("No valid test dates found even in previous month.")
+                self.reset_reschedule()
+                return False
+
+        except Exception as exc:
+            logger.error("Error while checking calendar: %s", exc)
+            capture_screenshot(self.driver, label="check_centre_for_tests_error")
+            self.reset_reschedule()
+            return False
+
+    def navigate_to_test_month(self, target_dt):
+        attempts = 0
+        while attempts < 12:
+            current_month = self.driver.find_element(By.CLASS_NAME, "BookingCalendar-currentMonth").text
+            if target_dt.strftime("%B") == current_month:
+                break
+            try:
+                self.driver.find_element(By.CLASS_NAME, "BookingCalendar-nav--prev").click()
+            except NoSuchElementException:
+                logger.warning("Could not navigate calendar to previous month.")
+                break
+            random_sleep(0.1, 0.2)
+            attempts += 1
+
+    def extract_test_slot_info(self, found_date_str):
+        container = self.driver.find_element(By.ID, f"date-{found_date_str}")
+        label = container.find_element(By.XPATH, ".//label")
+        label_for = label.get_attribute("for")
+
+        epoch_ms = int(label_for.replace("slot-", "")) / 1000
+        test_time_str = datetime.fromtimestamp(epoch_ms).strftime("%H:%M")
+
+        short_notice_raw = self.driver.find_element(By.ID, label_for).get_attribute("data-short-notice")
+        short_notice = (short_notice_raw == "true")
+
+        return label, test_time_str, short_notice
+
+    def attempt_booking(self, found_date_str, date_el, centre_to_search):
+        time.sleep(500)
+        try:
+            target_dt = datetime.strptime(found_date_str, "%Y-%m-%d")
+            self.navigate_to_test_month(target_dt)
+
             date_el.click()
-            container = driver.find_element(By.ID, f"date-{found_date_str}")
-            label = container.find_element(By.XPATH, ".//label")
-            label_for = label.get_attribute("for")
-            epoch_ms = int(label_for.replace("slot-", "")) / 1000
-            test_time_str = datetime.fromtimestamp(epoch_ms).strftime("%H:%M")
-
-            short_notice_raw = driver.find_element(By.ID, label_for).get_attribute("data-short-notice")
-            short_notice = (short_notice_raw == "true")
+            label, test_time_str, short_notice = self.extract_test_slot_info(found_date_str)
 
             logger.info("Found test: %s %s. Short notice=%s", found_date_str, test_time_str, short_notice)
             send_text_available(PHONE_NUMBER, found_date_str, test_time_str)
@@ -422,23 +540,24 @@ class DVSABot:
 
             label.click()
             time.sleep(0.2)
-            driver.find_element(By.ID, "slot-chosen-submit").click()
+            self.driver.find_element(By.ID, "slot-chosen-submit").click()
             time.sleep(0.4)
 
             if short_notice:
-                driver.find_element(By.XPATH, "(//button[@id='slot-warning-continue'])[2]").click()
+                self.driver.find_element(By.XPATH, "(//button[@id='slot-warning-continue'])[2]").click()
             else:
-                driver.find_element(By.ID, "slot-warning-continue").click()
+                self.driver.find_element(By.ID, "slot-warning-continue").click()
             random_sleep(1, 1)
 
             success = book_test_flow(
-                driver,
+                self.driver,
                 short_notice=short_notice,
                 solve_manually=SOLVE_MANUALLY,
                 coord_top_right=COORD_TOP_RIGHT,
                 coord_bottom_left=COORD_BOTTOM_LEFT,
                 auto_book_test=AUTO_BOOK_TEST
             )
+
             if success:
                 logger.info("Successfully booked test on %s at %s", found_date_str, test_time_str)
             else:
@@ -446,8 +565,7 @@ class DVSABot:
 
         except Exception as exc:
             logger.error("Failed booking flow: %s", exc)
-            capture_screenshot(driver, label="booking_flow")
-            return
+            capture_screenshot(self.driver, label="booking_flow")
 
 
 ###############################################################################
@@ -547,7 +665,6 @@ def run_initial_booking_flow(config_data):
 
                     logger.info(f"Solved Status was {status}.")
 
-
                     if solved is not True:
                         if MANUALLY_SOLVING_HANG:
                             logger.info("Solving manually.")
@@ -597,7 +714,8 @@ def run_initial_booking_flow(config_data):
 
             # --- NEW: Check for Oops Page ---
             try:
-                oops_elem = driver.find_element(By.XPATH, "//*[contains(text(), 'Oops - you went away and came back again')]")
+                oops_elem = driver.find_element(By.XPATH,
+                                                "//*[contains(text(), 'Oops - you went away and came back again')]")
                 if oops_elem.is_displayed():
                     logger.info("Detected Oops page. Clicking 'Continue' button to proceed.")
                     continue_button = driver.find_element(By.XPATH, "//button[contains(text(), 'Continue')]")
@@ -788,12 +906,6 @@ def run_initial_booking_flow(config_data):
         logger.info("Reached max attempts for initial booking flow. Exiting.")
 
 
-
-
-
-
-
-
 ###############################################################################
 #                                 MAIN SCRIPT                                 #
 ###############################################################################
@@ -827,10 +939,11 @@ def run_reschedule_flow(config_data):
         if is_time_between(DVSA_OPEN_TIME, DVSA_CLOSE_TIME):
             try:
                 bot = DVSABot(config_data)
+                logger.info("Setting up driver for reschedule flow...")
                 bot.login()
-                if bot.active:
-                    bot.search_and_book()
-                random_sleep(DVSA_DELAY, 10)
+                logger.info("Driver setup complete.")
+
+                bot.search_and_book()
 
             except Exception as exc:
                 logger.error("Top-level exception in reschedule attempt: %s", exc)
